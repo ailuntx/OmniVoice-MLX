@@ -134,32 +134,11 @@ class MLXRMSNorm:
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        output = x * mx.rsqrt(mx.mean(mx.square(x.astype(mx.float32)), axis=-1, keepdims=True) + self.eps)
-        return output.astype(x.dtype) * self.weight
+        return mx.fast.rms_norm(x, self.weight, self.eps)
 
 
-def _rotate_half(x: mx.array) -> mx.array:
-    half = x.shape[-1] // 2
-    return mx.concatenate([-x[..., half:], x[..., :half]], axis=-1)
-
-
-def _apply_rope(x: mx.array, rope_theta: float) -> mx.array:
-    seq_len = x.shape[-2]
-    head_dim = x.shape[-1]
-    positions = mx.arange(seq_len, dtype=mx.float32)
-    dims = mx.arange(0, head_dim, 2, dtype=mx.float32)
-    inv_freq = mx.power(mx.array(rope_theta, dtype=mx.float32), -dims / head_dim)
-    freqs = positions[:, None] * inv_freq[None, :]
-    emb = mx.concatenate([freqs, freqs], axis=-1)
-    cos = mx.cos(emb)[None, None, :, :]
-    sin = mx.sin(emb)[None, None, :, :]
-    return (x * cos + _rotate_half(x) * sin).astype(x.dtype)
-
-
-def _repeat_kv(x: mx.array, repeats: int) -> mx.array:
-    if repeats == 1:
-        return x
-    return mx.repeat(x, repeats, axis=1)
+def _apply_rope(x: mx.array, rope_theta: float, offset: int = 0) -> mx.array:
+    return mx.fast.rope(x, x.shape[-1], traditional=False, base=rope_theta, scale=1.0, offset=offset)
 
 
 def _silu(x: mx.array) -> mx.array:
@@ -167,69 +146,78 @@ def _silu(x: mx.array) -> mx.array:
 
 
 class MLXQwen3Attention:
-    def __init__(self, cfg: MLXQwen3Config, weights: dict[str, mx.array], prefix: str):
+    def __init__(self, cfg: MLXQwen3Config, weights: dict[str, mx.array], prefix: str, layer_idx: int = 0):
         self.cfg = cfg
+        self.layer_idx = layer_idx
         self.num_heads = cfg.num_attention_heads
         self.num_kv_heads = cfg.num_key_value_heads
         self.head_dim = cfg.head_dim
         self.scale = self.head_dim**-0.5
-        self.q_proj = _linear_from_weights(weights, f"{prefix}.q_proj")
-        self.k_proj = _linear_from_weights(weights, f"{prefix}.k_proj")
-        self.v_proj = _linear_from_weights(weights, f"{prefix}.v_proj")
+        # one fused matmul for q/k/v (Qwen3 has no qkv bias)
+        self.qkv_proj = MLXLinear(mx.concatenate([weights[f"{prefix}.{n}_proj.weight"] for n in "qkv"], axis=0))
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
         self.o_proj = _linear_from_weights(weights, f"{prefix}.o_proj")
         self.q_norm = _optional_rms_norm(weights, f"{prefix}.q_norm", cfg.rms_norm_eps)
         self.k_norm = _optional_rms_norm(weights, f"{prefix}.k_norm", cfg.rms_norm_eps)
 
-    def __call__(self, x: mx.array, attention_mask: Optional[mx.array]) -> mx.array:
+    def __call__(self, x: mx.array, attention_mask: Optional[mx.array], cache: Optional[dict] = None) -> mx.array:
         batch, seq_len, _ = x.shape
-        q = self.q_proj(x).reshape(batch, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = self.k_proj(x).reshape(batch, seq_len, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = self.v_proj(x).reshape(batch, seq_len, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q, k, v = mx.split(self.qkv_proj(x), [self.q_size, self.q_size + self.kv_size], axis=-1)
+        q = q.reshape(batch, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        k = k.reshape(batch, seq_len, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        v = v.reshape(batch, seq_len, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
         if self.q_norm is not None:
             q = self.q_norm(q)
         if self.k_norm is not None:
             k = self.k_norm(k)
 
-        q = _apply_rope(q, self.cfg.rope_theta)
-        k = _apply_rope(k, self.cfg.rope_theta)
+        # prefix cache: "capture" stores row 0's prefix K/V; "use" means x is only the suffix
+        offset = cache["prefix_len"] if cache is not None and cache["mode"] == "use" else 0
+        q = _apply_rope(q, self.cfg.rope_theta, offset)
+        k = _apply_rope(k, self.cfg.rope_theta, offset)
+        if cache is not None:
+            if cache["mode"] == "capture":
+                n = cache["prefix_len"]
+                cache["kv"][self.layer_idx] = (k[:1, :, :n], v[:1, :, :n])
+            else:
+                pk, pv = cache["kv"][self.layer_idx]
+                k = mx.concatenate([mx.broadcast_to(pk, (batch,) + pk.shape[1:]), k], axis=2)
+                v = mx.concatenate([mx.broadcast_to(pv, (batch,) + pv.shape[1:]), v], axis=2)
 
-        repeats = self.num_heads // self.num_kv_heads
-        k = _repeat_kv(k, repeats)
-        v = _repeat_kv(v, repeats)
-
-        scores = (q @ k.transpose(0, 1, 3, 2)) * self.scale
-        if attention_mask is not None:
-            scores = mx.where(attention_mask, scores, mx.array(-1e9, dtype=scores.dtype))
-        probs = mx.softmax(scores.astype(mx.float32), axis=-1).astype(x.dtype)
-        values = probs @ v
+        # fused kernel; handles GQA without repeating k/v
+        values = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=attention_mask)
         values = values.transpose(0, 2, 1, 3).reshape(batch, seq_len, self.num_heads * self.head_dim)
         return self.o_proj(values)
 
 
 class MLXQwen3MLP:
     def __init__(self, weights: dict[str, mx.array], prefix: str):
-        self.gate_proj = _linear_from_weights(weights, f"{prefix}.gate_proj")
-        self.up_proj = _linear_from_weights(weights, f"{prefix}.up_proj")
+        # gate and up share one fused matmul
+        self.gate_up_proj = MLXLinear(
+            mx.concatenate([weights[f"{prefix}.gate_proj.weight"], weights[f"{prefix}.up_proj.weight"]], axis=0)
+        )
         self.down_proj = _linear_from_weights(weights, f"{prefix}.down_proj")
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(_silu(self.gate_proj(x)) * self.up_proj(x))
+        gate, up = mx.split(self.gate_up_proj(x), 2, axis=-1)
+        return self.down_proj(_silu(gate) * up)
 
 
 class MLXQwen3Layer:
     def __init__(self, cfg: MLXQwen3Config, weights: dict[str, mx.array], layer_idx: int):
         prefix = f"llm.layers.{layer_idx}"
         self.input_layernorm = MLXRMSNorm(weights[f"{prefix}.input_layernorm.weight"], cfg.rms_norm_eps)
-        self.self_attn = MLXQwen3Attention(cfg, weights, f"{prefix}.self_attn")
+        self.self_attn = MLXQwen3Attention(cfg, weights, f"{prefix}.self_attn", layer_idx)
         self.post_attention_layernorm = MLXRMSNorm(
             weights[f"{prefix}.post_attention_layernorm.weight"],
             cfg.rms_norm_eps,
         )
         self.mlp = MLXQwen3MLP(weights, f"{prefix}.mlp")
 
-    def __call__(self, x: mx.array, attention_mask: Optional[mx.array]) -> mx.array:
-        x = x + self.self_attn(self.input_layernorm(x), attention_mask)
+    def __call__(self, x: mx.array, attention_mask: Optional[mx.array], cache: Optional[dict] = None) -> mx.array:
+        x = x + self.self_attn(self.input_layernorm(x), attention_mask, cache)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
@@ -243,10 +231,10 @@ class MLXQwen3Model:
     def embed(self, input_ids: mx.array) -> mx.array:
         return self.embed_tokens[input_ids]
 
-    def __call__(self, inputs_embeds: mx.array, attention_mask: Optional[mx.array]) -> mx.array:
+    def __call__(self, inputs_embeds: mx.array, attention_mask: Optional[mx.array], cache: Optional[dict] = None) -> mx.array:
         hidden_states = inputs_embeds
         for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask)
+            hidden_states = layer(hidden_states, attention_mask, cache)
         return self.norm(hidden_states)
 
 
@@ -642,9 +630,10 @@ class OmniVoiceMLX:
         input_ids: mx.array,
         audio_mask: mx.array,
         attention_mask: Optional[mx.array] = None,
+        cache: Optional[dict] = None,
     ) -> mx.array:
         inputs_embeds = self._prepare_embed_inputs(input_ids, audio_mask)
-        hidden_states = self.llm(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+        hidden_states = self.llm(inputs_embeds=inputs_embeds, attention_mask=attention_mask, cache=cache)
         batch_size, seq_len, _ = hidden_states.shape
         logits_flat = hidden_states @ self.audio_head_weight.T
         audio_logits = logits_flat.reshape(
@@ -731,13 +720,46 @@ class OmniVoiceMLX:
             * gen_config.layer_penalty_factor
         )
 
+        # Prefix cache (Fast-dLLM style approximation): style/text/reference K/V are captured on a
+        # full pass every `prefix_refresh` steps; steps in between run only the target-audio tokens.
+        # shortcut: batch_size 1 only, batched calls fall back to full passes.
+        use_cache = gen_config.prefix_refresh > 0 and batch_size == 1
+        if use_cache:
+            p_len = c_lens[0] - task.target_lens[0]
+            t0 = task.target_lens[0]
+            cache = {"mode": "capture", "prefix_len": p_len, "kv": [None] * len(self.llm.layers)}
+            suffix_mask = np.ones((2, 1, t0, p_len + t0), dtype=bool)
+            suffix_mask[1, :, :, :p_len] = False  # unconditional row never sees the prefix
+            suffix_mask = mx.array(suffix_mask)
+
+        # uncond CFG logits are recomputed every `uncond_reuse` steps (and on full passes), reused in between
+        reuse = gen_config.uncond_reuse if use_cache else 0
+        layer_penalty_mx = mx.array(layer_penalty)
         for step in range(gen_config.num_step):
-            batch_logits = self.forward(
-                input_ids=mx.array(batch_input_ids),
-                audio_mask=mx.array(batch_audio_mask),
-                attention_mask=mx.array(batch_attention_mask),
-            ).astype(mx.float32)
-            mx.eval(batch_logits)
+            if use_cache and step % gen_config.prefix_refresh != 0:
+                cache["mode"] = "use"
+                rows = 2 if reuse <= 1 or step % reuse == 0 else 1
+                out = self.forward(
+                    input_ids=mx.array(np.stack([batch_input_ids[0, :, p_len : c_lens[0]], batch_input_ids[1, :, :t0]][:rows])),
+                    audio_mask=mx.array(np.stack([batch_audio_mask[0, p_len : c_lens[0]], batch_audio_mask[1, :t0]][:rows])),
+                    attention_mask=suffix_mask[:rows],
+                    cache=cache,
+                ).astype(mx.float32)
+                c_rows = [out[0:1]]
+                if rows == 2:
+                    u_rows = [out[1:2]]
+            else:
+                if use_cache:
+                    cache["mode"] = "capture"
+                batch_logits = self.forward(
+                    input_ids=mx.array(batch_input_ids),
+                    audio_mask=mx.array(batch_audio_mask),
+                    attention_mask=mx.array(batch_attention_mask),
+                    cache=cache if use_cache else None,
+                ).astype(mx.float32)
+                mx.eval(batch_logits, *([kv for pair in cache["kv"] for kv in pair] if use_cache else []))
+                c_rows = [batch_logits[i : i + 1, :, c_lens[i] - task.target_lens[i] : c_lens[i], :] for i in range(batch_size)]
+                u_rows = [batch_logits[batch_size + i : batch_size + i + 1, :, : task.target_lens[i], :] for i in range(batch_size)]
 
             for i in range(batch_size):
                 k = schedules[i][step]
@@ -746,13 +768,14 @@ class OmniVoiceMLX:
 
                 c_len = c_lens[i]
                 t_len = task.target_lens[i]
-                c_logits = np.asarray(batch_logits[i : i + 1, :, c_len - t_len : c_len, :], dtype=np.float32)
-                u_logits = np.asarray(batch_logits[batch_size + i : batch_size + i + 1, :, :t_len, :], dtype=np.float32)
-                pred_tokens, scores = self._predict_tokens_with_scoring(c_logits, u_logits, gen_config)
-
-                scores = scores - layer_penalty
+                # CFG, argmax and confidence run on the GPU; only (1, C, T) tokens/scores come back to numpy
+                pred_tokens, scores = self._predict_tokens_mx(c_rows[i], u_rows[i], gen_config)
+                scores = scores - layer_penalty_mx
                 if gen_config.position_temperature > 0.0:
-                    scores = _gumbel_sample_np(scores, gen_config.position_temperature)
+                    scores = scores / gen_config.position_temperature + mx.random.gumbel(scores.shape)
+                mx.eval(pred_tokens, scores)
+                pred_tokens = np.array(pred_tokens, dtype=np.int64)
+                scores = np.array(scores, dtype=np.float32)
 
                 sample_tokens = tokens[i : i + 1, :, :t_len]
                 scores[sample_tokens != self.config.audio_mask_id] = -np.inf
@@ -772,6 +795,26 @@ class OmniVoiceMLX:
                 batch_input_ids[batch_size + i : batch_size + i + 1, :, :t_len] = sample_tokens
 
         return [tokens[i, :, : task.target_lens[i]].copy() for i in range(batch_size)]
+
+    def _predict_tokens_mx(
+        self,
+        c_logits: mx.array,
+        u_logits: mx.array,
+        gen_config: OmniVoiceGenerationConfig,
+    ) -> tuple[mx.array, mx.array]:
+        if gen_config.class_temperature > 0.0:
+            # shortcut: top-k class sampling stays on the numpy path, port it if it gets used
+            p, sc = self._predict_tokens_with_scoring(np.array(c_logits), np.array(u_logits), gen_config)
+            return mx.array(p), mx.array(sc)
+        lsm = lambda x: x - mx.logsumexp(x, axis=-1, keepdims=True)
+        if gen_config.guidance_scale != 0:
+            c_lp, u_lp = lsm(c_logits), lsm(u_logits)
+            log_probs = lsm(c_lp + gen_config.guidance_scale * (c_lp - u_lp))
+        else:
+            log_probs = lsm(c_logits)
+        not_mask = mx.arange(log_probs.shape[-1]) != self.config.audio_mask_id
+        log_probs = mx.where(not_mask, log_probs, -mx.inf)
+        return mx.argmax(log_probs, axis=-1), mx.max(log_probs, axis=-1)
 
     def _predict_tokens_with_scoring(
         self,

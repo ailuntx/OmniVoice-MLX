@@ -21,6 +21,8 @@ audio = model.generate(text="Hello world", generation_config=config)
 | `denoise` | bool | True | Prepend the `<|denoise|>` token to the input, which signals the model to produce cleaner speech. |
 | `guidance_scale` | float | 2.0 | Classifier-free guidance scale.|
 | `t_shift` | float | 0.1 | Time-step shift for the noise schedule. Smaller values emphasise earlier steps in decoding. |
+| `prefix_refresh` | int | 0 | MLX only. >0 caches the text/reference K/V and runs only the target-audio suffix, with a full pass every N steps. See [MLX speedups](mlx-speedups.md). |
+| `uncond_reuse` | int | 0 | MLX only, needs `prefix_refresh`. >1 recomputes the CFG unconditional logits every N steps and reuses them in between. |
 
 ## Sampling
 
