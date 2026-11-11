@@ -732,17 +732,22 @@ class OmniVoiceMLX:
             suffix_mask[1, :, :, :p_len] = False  # unconditional row never sees the prefix
             suffix_mask = mx.array(suffix_mask)
 
+        # uncond CFG logits are recomputed every `uncond_reuse` steps (and on full passes), reused in between
+        reuse = gen_config.uncond_reuse if use_cache else 0
+        layer_penalty_mx = mx.array(layer_penalty)
         for step in range(gen_config.num_step):
             if use_cache and step % gen_config.prefix_refresh != 0:
                 cache["mode"] = "use"
+                rows = 2 if reuse <= 1 or step % reuse == 0 else 1
                 out = self.forward(
-                    input_ids=mx.array(np.stack([batch_input_ids[0, :, p_len : c_lens[0]], batch_input_ids[1, :, :t0]])),
-                    audio_mask=mx.array(np.stack([batch_audio_mask[0, p_len : c_lens[0]], batch_audio_mask[1, :t0]])),
-                    attention_mask=suffix_mask,
+                    input_ids=mx.array(np.stack([batch_input_ids[0, :, p_len : c_lens[0]], batch_input_ids[1, :, :t0]][:rows])),
+                    audio_mask=mx.array(np.stack([batch_audio_mask[0, p_len : c_lens[0]], batch_audio_mask[1, :t0]][:rows])),
+                    attention_mask=suffix_mask[:rows],
                     cache=cache,
                 ).astype(mx.float32)
-                mx.eval(out)
-                c_rows, u_rows = [out[0:1]], [out[1:2]]
+                c_rows = [out[0:1]]
+                if rows == 2:
+                    u_rows = [out[1:2]]
             else:
                 if use_cache:
                     cache["mode"] = "capture"
@@ -763,13 +768,14 @@ class OmniVoiceMLX:
 
                 c_len = c_lens[i]
                 t_len = task.target_lens[i]
-                c_logits = np.asarray(c_rows[i], dtype=np.float32)
-                u_logits = np.asarray(u_rows[i], dtype=np.float32)
-                pred_tokens, scores = self._predict_tokens_with_scoring(c_logits, u_logits, gen_config)
-
-                scores = scores - layer_penalty
+                # CFG, argmax and confidence run on the GPU; only (1, C, T) tokens/scores come back to numpy
+                pred_tokens, scores = self._predict_tokens_mx(c_rows[i], u_rows[i], gen_config)
+                scores = scores - layer_penalty_mx
                 if gen_config.position_temperature > 0.0:
-                    scores = _gumbel_sample_np(scores, gen_config.position_temperature)
+                    scores = scores / gen_config.position_temperature + mx.random.gumbel(scores.shape)
+                mx.eval(pred_tokens, scores)
+                pred_tokens = np.array(pred_tokens, dtype=np.int64)
+                scores = np.array(scores, dtype=np.float32)
 
                 sample_tokens = tokens[i : i + 1, :, :t_len]
                 scores[sample_tokens != self.config.audio_mask_id] = -np.inf
@@ -789,6 +795,26 @@ class OmniVoiceMLX:
                 batch_input_ids[batch_size + i : batch_size + i + 1, :, :t_len] = sample_tokens
 
         return [tokens[i, :, : task.target_lens[i]].copy() for i in range(batch_size)]
+
+    def _predict_tokens_mx(
+        self,
+        c_logits: mx.array,
+        u_logits: mx.array,
+        gen_config: OmniVoiceGenerationConfig,
+    ) -> tuple[mx.array, mx.array]:
+        if gen_config.class_temperature > 0.0:
+            # shortcut: top-k class sampling stays on the numpy path, port it if it gets used
+            p, sc = self._predict_tokens_with_scoring(np.array(c_logits), np.array(u_logits), gen_config)
+            return mx.array(p), mx.array(sc)
+        lsm = lambda x: x - mx.logsumexp(x, axis=-1, keepdims=True)
+        if gen_config.guidance_scale != 0:
+            c_lp, u_lp = lsm(c_logits), lsm(u_logits)
+            log_probs = lsm(c_lp + gen_config.guidance_scale * (c_lp - u_lp))
+        else:
+            log_probs = lsm(c_logits)
+        not_mask = mx.arange(log_probs.shape[-1]) != self.config.audio_mask_id
+        log_probs = mx.where(not_mask, log_probs, -mx.inf)
+        return mx.argmax(log_probs, axis=-1), mx.max(log_probs, axis=-1)
 
     def _predict_tokens_with_scoring(
         self,

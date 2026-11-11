@@ -108,6 +108,7 @@ class OmniVoiceGenerationConfig:
     audio_chunk_duration: float = 15.0
     audio_chunk_threshold: float = 30.0
     prefix_refresh: int = 0  # MLX only: >0 caches text/reference K/V, full pass every N steps
+    uncond_reuse: int = 0  # MLX only, needs prefix_refresh: >1 recomputes CFG uncond logits every N steps
 
     @classmethod
     def from_dict(cls, kwargs_dict):
